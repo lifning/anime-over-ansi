@@ -107,6 +107,36 @@ pub unsafe fn closest_ansi_sse(r: u8, g: u8, b: u8) -> u8 {
     results.argmin().unwrap() as u8
 }
 
+#[cfg(any(target_arch = "powerpc64le", target_arch = "powerpc64", target_arch = "powerpcle", target_arch = "powerpc"))]
+#[target_feature(enable = "altivec")]
+pub unsafe fn closest_ansi_altivec(r: u8, g: u8, b: u8) -> u8 {
+    #[cfg(any(target_arch = "powerpc64le", target_arch = "powerpc64"))]
+    use std::arch::powerpc64::*;
+    #[cfg(any(target_arch = "powerpcle", target_arch = "powerpc"))]
+    use std::arch::powerpc::*;
+
+    let lab = Lab::from_rgb(&[r, g, b]);
+    let lab_altivec = vec_ld(0, [lab.l, lab.a, lab.b, 0.0].as_ptr());
+    let zero = vec_splats(0.0);
+
+    let mut results: [f32; 256] = [0.0; 256];
+
+    LAB_PALETTE_FLATTENED
+        .chunks_exact(4)
+        .enumerate()
+        .for_each(|(i, step)| {
+            let pal_altivec = vec_ld(0, step.as_ptr() as *const f32);
+            let mut res = vec_sub(lab_altivec, pal_altivec);
+            res = vec_madd(res, res, zero);
+
+            let (r1, r2, r3, _): (f32, f32, f32, f32) = core::mem::transmute(res);
+
+            *results.get_unchecked_mut(i) = r1 + r2 + r3; // add up left delta E
+        });
+
+    results.argmin().unwrap() as u8
+}
+
 pub fn closest_ansi_scalar(r: u8, g: u8, b: u8) -> u8 {
     let lab = Lab::from_rgb(&[r, g, b]);
     let mut results: [f32; 256] = [0.0; 256];
@@ -125,6 +155,18 @@ pub fn closest_ansi(r: u8, g: u8, b: u8) -> u8 {
             return unsafe { closest_ansi_avx(r, g, b) };
         } else if is_x86_feature_detected!("sse") {
             return unsafe { closest_ansi_sse(r, g, b) };
+        }
+    }
+    #[cfg(any(target_arch = "powerpc64le", target_arch = "powerpc64"))]
+    {
+        if is_powerpc64_feature_detected!("altivec") {
+            return unsafe { closest_ansi_altivec(r, g, b) };
+        } // TODO: else if is_powerpc64_feature_detected("vsx") {}
+    }
+    #[cfg(any(target_arch = "powerpcle", target_arch = "powerpc"))]
+    {
+        if is_powerpc_feature_detected!("altivec") {
+            return unsafe { closest_ansi_altivec(r, g, b) };
         }
     }
 
