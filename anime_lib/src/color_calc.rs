@@ -1,5 +1,6 @@
+use std::cmp::Ordering;
 use crate::palette::*;
-use argmm::ArgMinMax;
+use argmm::{ArgMinMax, simple_argmin};
 use lazy_static::lazy_static;
 
 // D65 standard illuminant refs
@@ -107,6 +108,185 @@ pub unsafe fn closest_ansi_sse(r: u8, g: u8, b: u8) -> u8 {
     results.argmin().unwrap() as u8
 }
 
+fn split_array<T: Copy>(arr: &[T], lane_size: usize) -> (Option<&[T]>, Option<&[T]>) {
+    let n = arr.len();
+
+    if n < lane_size * 2 {
+        return (Some(arr), None);
+    };
+
+    let (left_arr, right_arr) = arr.split_at(n % lane_size);
+
+    match (left_arr.is_empty(), right_arr.is_empty()) {
+        (true, true) => (None, None),
+        (false, false) => (Some(left_arr), Some(right_arr)),
+        (true, false) => (None, Some(right_arr)),
+        (false, true) => (Some(left_arr), None),
+    }
+}
+
+#[inline]
+fn find_final_index_min<T: PartialOrd>(
+    remainder_result: (T, usize),
+    simd_result: (T, usize),
+) -> Option<usize> {
+    let result = match remainder_result.0.partial_cmp(&simd_result.0).unwrap() {
+        Ordering::Less => remainder_result.1,
+        Ordering::Equal => std::cmp::min(remainder_result.1, simd_result.1),
+        Ordering::Greater => simd_result.1,
+    };
+    Some(result)
+}
+
+#[allow(unreachable_code)]
+fn is_altivec_detected() -> bool {
+    #[cfg(any(target_arch = "powerpc64", target_arch = "powerpc64"))]
+    return is_powerpc64_feature_detected!("altivec");
+    #[cfg(any(target_arch = "powerpcle", target_arch = "powerpc"))]
+    return is_powerpc_feature_detected!("altivec");
+
+    return false;
+}
+
+#[cfg(any(target_arch = "powerpc64le", target_arch = "powerpc64", target_arch = "powerpcle", target_arch = "powerpc"))]
+pub fn argmin_f32_altivec(arr: &[f32]) -> Option<usize> {
+    if is_altivec_detected() {
+        match split_array(arr, 4) {
+            (Some(rem), Some(sim)) => {
+                let rem_min_index = simple_argmin(rem);
+                let rem_result = (rem[rem_min_index], rem_min_index);
+                let sim_result = unsafe { core_f32_argmin_altivec(sim, rem.len()) };
+                find_final_index_min(rem_result, sim_result)
+            }
+            (Some(rem), None) => Some(simple_argmin(rem)),
+            (None, Some(sim)) => {
+                let sim_result = unsafe { core_f32_argmin_altivec(sim, 0) };
+                Some(sim_result.1)
+            }
+            (None, None) => None,
+        }
+    } else {
+        Some(simple_argmin(arr))
+    }
+}
+
+#[cfg(any(target_arch = "powerpc64le", target_arch = "powerpc64", target_arch = "powerpcle", target_arch = "powerpc"))]
+#[target_feature(enable = "altivec")]
+pub unsafe fn core_f32_argmin_altivec(sim_arr: &[f32], rem_offset: usize) -> (f32, usize) {
+    #[cfg(any(target_arch = "powerpc64le", target_arch = "powerpc64"))]
+    use std::arch::powerpc64::*;
+    #[cfg(any(target_arch = "powerpcle", target_arch = "powerpc"))]
+    use std::arch::powerpc::*;
+/*
+    #[allow(improper_ctypes)]
+    extern "C" {
+        #[link_name = "llvm.ppc.altivec.vand"]
+        fn vand(a: vector_float, b: vector_bool_int) -> vector_float;
+        #[link_name = "llvm.ppc.altivec.vandc"]
+        fn vandc(a: vector_float, b: vector_bool_int) -> vector_float;
+        #[link_name = "llvm.ppc.altivec.vcmpeqfp"]
+        fn vcmpeqfp(a: vector_float, b: vector_float) -> vector_bool_int;
+        #[link_name = "llvm.ppc.altivec.vcmpgtfpx"]
+        fn vcmpgtfpx(a: vector_float, b: vector_float) -> vector_bool_int;
+        #[link_name = "llvm.ppc.altivec.vminfp"]
+        fn vminfp(a: vector_float, b: vector_float) -> vector_float;
+        #[link_name = "llvm.ppc.altivec.vmrghw"]
+        fn vmrghw(a: vector_float, b: vector_float) -> vector_float;
+        #[link_name = "llvm.ppc.altivec.vmrglw"]
+        fn vmrglw(a: vector_float, b: vector_float) -> vector_float;
+        #[link_name = "llvm.ppc.altivec.vor"]
+        fn vor(a: vector_float, b: vector_bool_int) -> vector_float;
+    }
+*/
+/*
+    unsafe fn vand(a: vector_float, b: vector_bool_int) -> vector_float {
+        let d;
+        asm!("vand {d}, {a}, {b}", a = in(reg) a, b = in(reg) b, d = out(reg) d);
+        d
+    }
+    unsafe fn vandc(a: vector_float, b: vector_bool_int) -> vector_float {
+        let d;
+        asm!("vandc {d}, {a}, {b}", a = in(reg) a, b = in(reg) b, d = out(reg) d);
+        d
+    }
+    unsafe fn vcmpeqfp(a: vector_float, b: vector_float) -> vector_bool_int {
+        let d;
+        asm!("vcmpeqfp {d}, {a}, {b}", a = in(reg) a, b = in(reg) b, d = out(reg) d);
+        d
+    }
+    unsafe fn vcmpgtfpx(a: vector_float, b: vector_float) -> vector_bool_int {
+        let d;
+        asm!("vcmpgtfpx {d}, {a}, {b}", a = in(reg) a, b = in(reg) b, d = out(reg) d);
+        d
+    }
+    unsafe fn vminfp(a: vector_float, b: vector_float) -> vector_float {
+        let d;
+        asm!("vminfp {d}, {a}, {b}", a = in(reg) a, b = in(reg) b, d = out(reg) d);
+        d
+    }
+    unsafe fn vmrghw(a: vector_float, b: vector_float) -> vector_float{
+        let d;
+        asm!("vmrghw {d}, {a}, {b}", a = in(reg) a, b = in(reg) b, d = out(reg) d);
+        d
+    }
+    unsafe fn vmrglw(a: vector_float, b: vector_float) -> vector_float{
+        let d;
+        asm!("vmrglw {d}, {a}, {b}", a = in(reg) a, b = in(reg) b, d = out(reg) d);
+        d
+    }
+    unsafe fn vor(a: vector_float, b: vector_bool_int) -> vector_float{
+        let d;
+        asm!("vor {d}, {a}, {b}", a = in(reg) a, b = in(reg) b, d = out(reg) d);
+        d
+    }
+*/
+
+    let offset = vec_splats(rem_offset as f32);
+    let mut index_low = vec_add(core::mem::transmute::<_, vector_float>((3.0f32, 2.0f32, 1.0f32, 0.0f32)), offset);
+
+    let increment = vec_splats(4.0);
+    let mut new_index_low = index_low;
+
+    let mut values_low = vec_ld(0, sim_arr.as_ptr() as *const f32);
+
+    sim_arr.chunks_exact(4).skip(1).for_each(|step| {
+        new_index_low = vec_add(new_index_low, increment);
+
+        let new_values = vec_ld(0, step.as_ptr() as *const f32);
+        let lt_mask = vcmpgtfpx(values_low, new_values);
+
+        values_low = vminfp(new_values, values_low);
+        index_low = vor(
+            vand(new_index_low, lt_mask),
+            core::mem::transmute(vandc(index_low, lt_mask)),
+        );
+    });
+
+    let highpack = vmrghw(values_low, values_low);
+    let lowpack = vmrglw(values_low, values_low);
+    let lowest = vminfp(highpack, lowpack);
+
+    let highpack = vmrghw(lowest, lowest);
+    let lowpack = vmrglw(lowest, lowest);
+    let lowest = vminfp(highpack, lowpack);
+
+    let low_mask = vcmpeqfp(lowest, values_low);
+
+    index_low = vor(
+        vand(index_low, low_mask),
+        core::mem::transmute(vandc(vec_splats(std::f32::MAX), low_mask)),
+    );
+
+    let value_array = core::mem::transmute::<_, [f32; 4]>(values_low);
+    let index_array = core::mem::transmute::<_, [f32; 4]>(index_low);
+
+    let min_index = argmm::simple_argmin(&index_array);
+    let value = *value_array.get_unchecked(min_index);
+    let index = *index_array.get_unchecked(min_index);
+
+    (value, index as usize)
+}
+
 #[cfg(any(target_arch = "powerpc64le", target_arch = "powerpc64", target_arch = "powerpcle", target_arch = "powerpc"))]
 #[target_feature(enable = "altivec")]
 pub unsafe fn closest_ansi_altivec(r: u8, g: u8, b: u8) -> u8 {
@@ -134,7 +314,7 @@ pub unsafe fn closest_ansi_altivec(r: u8, g: u8, b: u8) -> u8 {
             *results.get_unchecked_mut(i) = r1 + r2 + r3; // add up left delta E
         });
 
-    results.argmin().unwrap() as u8
+    argmin_f32_altivec(&results).unwrap() as u8
 }
 
 pub fn closest_ansi_scalar(r: u8, g: u8, b: u8) -> u8 {
@@ -157,15 +337,9 @@ pub fn closest_ansi(r: u8, g: u8, b: u8) -> u8 {
             return unsafe { closest_ansi_sse(r, g, b) };
         }
     }
-    #[cfg(any(target_arch = "powerpc64le", target_arch = "powerpc64"))]
+    #[cfg(any(target_arch = "powerpc64le", target_arch = "powerpc64", target_arch = "powerpcle", target_arch = "powerpc"))]
     {
-        if is_powerpc64_feature_detected!("altivec") {
-            return unsafe { closest_ansi_altivec(r, g, b) };
-        } // TODO: else if is_powerpc64_feature_detected("vsx") {}
-    }
-    #[cfg(any(target_arch = "powerpcle", target_arch = "powerpc"))]
-    {
-        if is_powerpc_feature_detected!("altivec") {
+        if is_altivec_detected() {
             return unsafe { closest_ansi_altivec(r, g, b) };
         }
     }
